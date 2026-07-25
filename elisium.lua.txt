@@ -188,7 +188,7 @@
 
     local GameInformation = loadstring(game:HttpGet("https://raw.githubusercontent.com/TheRealXORA/Roblox/refs/heads/Main/Scripts%20/Utilities%20/Fetch%20Game%20Information.luau"))()
     local Drawing = loadstring(game:HttpGet('https://raw.githubusercontent.com/LionTheGreatRealFrFr/Assets/refs/heads/main/DrawingLib'))()
-    local StompModule, DhLibrary if ReplicatedStorage:FindFirstChild("MainEvent") then StompModule, DhLibrary = loadstring(game:HttpGet("https://raw.githubusercontent.com/IAlwaysTap/Stomp-Effects/refs/heads/main/Stomp%20Effects.lua"))() end
+    local StompModule, DhLibrary if ReplicatedStorage:FindFirstChild("MainEvent") then StompModule, DhLibrary = loadstring(game:HttpGet(" "))() end
     local Esp = loadstring(game:HttpGet("https://raw.githubusercontent.com/haalfiperth/Elisium/refs/heads/main/Deps/Esp.lua"))()
     local Crosshair = loadstring(game:HttpGet("https://raw.githubusercontent.com/fouejp/serial/refs/heads/main/crosshair.lua"))() Crosshair.color = MainColor Crosshair.text = false Crosshair.indicator = false Crosshair.textoffset = IsMobile and 75 or 300
     local Rain = loadstring(game:HttpGet("https://raw.githubusercontent.com/haalfiperth/Elisium/refs/heads/main/Deps/Rain.lua"))()
