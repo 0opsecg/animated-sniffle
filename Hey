@@ -1,0 +1,989 @@
+local cloneref = cloneref or function(obj) return obj end
+
+local Players = cloneref(game:GetService("Players"))
+local RunService = cloneref(game:GetService("RunService"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local CollectionService = cloneref(game:GetService("CollectionService"))
+local StarterGui = cloneref(game:GetService("StarterGui"))
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+if not remotes then return end
+local combat = remotes:WaitForChild("Combat", 30)
+if not combat then return end
+local MercHitClaim = cloneref(combat:WaitForChild("MercHitClaim", 30))
+if not MercHitClaim then return end
+local WeaponFired = cloneref(combat:WaitForChild("WeaponFired", 30))
+if not WeaponFired then return end
+
+local WeaponsRegistry = require(ReplicatedStorage.Registries.Weapons)
+local BulletController = require(ReplicatedStorage.Modules.Client.Controllers.BulletController)
+local GunController = require(ReplicatedStorage.Modules.Client.Controllers.GunController)
+
+local HitmarkerConfig = {
+	Enabled = true,
+	Scale = 2.0,
+	NormalSize = 16,
+	HeadshotSize = 26,
+	NormalColor = Color3.fromRGB(255, 255, 255),
+	HeadshotColor = Color3.fromRGB(255, 60, 60),
+	Duration = 0.28,
+}
+
+local activeHitmarkers = {}
+local hitmarkerConnection = nil
+
+local function createHitmarker(worldPosition, isHeadshot)
+	if not HitmarkerConfig.Enabled then return end
+	
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return end
+	
+	local hud = playerGui:FindFirstChild("HUD")
+	if not hud then
+		hud = Instance.new("ScreenGui")
+		hud.Name = "HUD"
+		hud.ResetOnSpawn = false
+		hud.Parent = playerGui
+	end
+	
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+	
+	local screenPos, onScreen = camera:WorldToViewportPoint(worldPosition)
+	if not onScreen or screenPos.Z <= 0 then return end
+	
+	local baseSize = isHeadshot and HitmarkerConfig.HeadshotSize or HitmarkerConfig.NormalSize
+	local finalSize = baseSize * HitmarkerConfig.Scale
+	
+	local frame = Instance.new("Frame")
+	frame.Name = isHeadshot and "HitmarkerHeadshot" or "Hitmarker"
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	frame.Size = UDim2.fromOffset(finalSize, finalSize)
+	frame.Position = UDim2.fromOffset(screenPos.X, screenPos.Y)
+	frame.Visible = true
+	
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = frame
+	
+	local stroke = Instance.new("UIStroke")
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.LineJoinMode = Enum.LineJoinMode.Round
+	stroke.Color = isHeadshot and HitmarkerConfig.HeadshotColor or HitmarkerConfig.NormalColor
+	stroke.Thickness = (isHeadshot and 2.25 or 1.5) * HitmarkerConfig.Scale
+	stroke.Transparency = 0
+	stroke.Parent = frame
+	
+	local scale = Instance.new("UIScale")
+	scale.Scale = 0.1
+	scale.Parent = frame
+	
+	frame.Parent = hud
+	
+	local hitmarkerData = {
+		ring = frame,
+		stroke = stroke,
+		scale = scale,
+		worldPos = worldPosition,
+		bornAt = os.clock()
+	}
+	
+	table.insert(activeHitmarkers, hitmarkerData)
+	
+	if not hitmarkerConnection then
+		hitmarkerConnection = RunService.RenderStepped:Connect(function()
+			local currentTime = os.clock()
+			local camera = workspace.CurrentCamera
+			
+			for i = #activeHitmarkers, 1, -1 do
+				local marker = activeHitmarkers[i]
+				
+				if not marker.ring.Parent then
+					table.remove(activeHitmarkers, i)
+				else
+					local elapsed = currentTime - marker.bornAt
+					local progress = elapsed / HitmarkerConfig.Duration
+					
+					local easeOut = 1 - progress
+					local easeCubic = 1 - easeOut * easeOut * easeOut
+					marker.scale.Scale = easeCubic * 1.9 + 0.1
+					
+					if elapsed >= HitmarkerConfig.Duration then
+						marker.ring:Destroy()
+						table.remove(activeHitmarkers, i)
+					else
+						if elapsed >= 0.08 then
+							local fadeProgress = (elapsed - 0.08) / 0.2
+							marker.stroke.Transparency = math.clamp(fadeProgress, 0, 1)
+						end
+						
+						if camera then
+							local screenPos, onScreen = camera:WorldToViewportPoint(marker.worldPos)
+							if onScreen and screenPos.Z > 0 then
+								marker.ring.Position = UDim2.fromOffset(screenPos.X, screenPos.Y)
+								marker.ring.Visible = true
+							else
+								marker.ring.Visible = false
+							end
+						end
+					end
+				end
+			end
+			
+			if #activeHitmarkers == 0 and hitmarkerConnection then
+				hitmarkerConnection:Disconnect()
+				hitmarkerConnection = nil
+			end
+		end)
+	end
+end
+
+local InfiniteAmmo = {
+	Enabled = true,
+	AmmoPool = nil,
+	OriginalConsume = nil,
+	OriginalGetReserve = nil,
+	OriginalFire = nil,
+}
+
+local function SetupInfiniteAmmo()
+	if not InfiniteAmmo.Enabled then return end
+
+	local success, AmmoPool = pcall(function()
+		return require(ReplicatedStorage.Modules.Shared.AmmoPool)
+	end)
+	if not success or not AmmoPool then
+		return
+	end
+	InfiniteAmmo.AmmoPool = AmmoPool
+
+	if AmmoPool.ConsumeAmmo and not InfiniteAmmo.OriginalConsume then
+		InfiniteAmmo.OriginalConsume = AmmoPool.ConsumeAmmo
+		AmmoPool.ConsumeAmmo = function(self, ammoType, amount)
+			if ammoType == "infinite" then
+				return amount
+			end
+			return amount
+		end
+	end
+
+	if AmmoPool.SetAmmo and not InfiniteAmmo.OriginalSetAmmo then
+		InfiniteAmmo.OriginalSetAmmo = AmmoPool.SetAmmo
+		AmmoPool.SetAmmo = function(self, ammoType, amount)
+			if ammoType == "infinite" then return end
+			local maxReserve = self._maxReserve[ammoType] or math.huge
+			self._pools[ammoType] = maxReserve
+			if self.AmmoChanged then
+				self.AmmoChanged:Fire(ammoType, maxReserve, 0)
+			end
+		end
+	end
+
+	if GunController and GunController.Weapon then
+		local weapon = GunController.Weapon
+		if weapon then
+			weapon.AmmoType = "infinite"
+			weapon.MagAmmo = weapon.MaxMagSize or 999
+		end
+	end
+end
+
+local function MaintainInfiniteAmmo()
+	if not InfiniteAmmo.Enabled then return end
+
+	local AmmoPool = InfiniteAmmo.AmmoPool
+	if AmmoPool and AmmoPool._pools then
+		for ammoType, maxAmount in pairs(AmmoPool._maxReserve or {}) do
+			if ammoType ~= "infinite" then
+				AmmoPool._pools[ammoType] = maxAmount
+			end
+		end
+	end
+
+	if GunController and GunController.Weapon then
+		local weapon = GunController.Weapon
+		if weapon and weapon.MagAmmo ~= nil then
+			local maxAmmo = weapon.MaxMagSize or 999
+			if weapon.MagAmmo <= 0 then
+				weapon.MagAmmo = maxAmmo
+				if weapon.AmmoChanged then
+					weapon.AmmoChanged:Fire(weapon.MagAmmo, 9999)
+				end
+			end
+		end
+	end
+end
+
+SetupInfiniteAmmo()
+
+local WeaponMods = {
+	FullAuto = true,
+	NoRecoil = false,
+	CustomFireRate = false,
+	FireRateMultiplier = 1.0,
+}
+
+local function ApplyWeaponMods()
+	if not WeaponsRegistry then return end
+
+	for weaponName, weaponData in pairs(WeaponsRegistry) do
+		if type(weaponData) == "table" and weaponData.FireRate then
+			if WeaponMods.FullAuto then
+				weaponData.FireMode = "Auto"
+				if weaponData.FireModes then
+					weaponData.FireModes = {"Auto", "Semi"}
+				end
+			end
+
+			if WeaponMods.NoRecoil then
+				weaponData.RecoilMult = 0
+				weaponData.RecoilPushMult = 0
+				weaponData.RecoilPitchMult = 0
+				weaponData.RecoilTilt = 0
+				weaponData.CameraRecoilMult = 0
+				weaponData.CameraRecoilAimMult = 0
+				weaponData.RecoilSpeedMult = 0
+				weaponData.FireDriftScale = 0
+				
+				if weaponData.Bloom then
+					weaponData.Bloom.Base = 0
+					weaponData.Bloom.PerShot = 0
+					weaponData.Bloom.Max = 0
+				end
+			end
+
+			if WeaponMods.CustomFireRate then
+				local originalRate = weaponData.FireRate
+				weaponData.FireRate = originalRate / WeaponMods.FireRateMultiplier
+			end
+		end
+	end
+	
+end
+
+local function ApplyGunControllerMods()
+	if not GunController then return end
+
+	if WeaponMods.NoRecoil and GunController.ApplyRecoil then
+		GunController.ApplyRecoil = function() end
+	end
+
+	if GunController.Weapon then
+		local weapon = GunController.Weapon
+		if weapon then
+			if WeaponMods.FullAuto then
+				weapon.FireMode = "auto"
+			end
+
+			if WeaponMods.NoRecoil and weapon.RecoilSpring then
+				weapon.RecoilSpring.s = 0
+				weapon.RecoilSpring.d = 0
+			end
+
+			if WeaponMods.CustomFireRate then
+				local currentName = weapon.Name
+				local weaponData = WeaponsRegistry[currentName]
+				if weaponData and weaponData.FireRate then
+					weapon.FireRate = weaponData.FireRate
+				end
+			end
+		end
+	end
+end
+
+ApplyWeaponMods()
+
+local currentWeaponName = nil
+local currentFireRate = 0.08
+local attackCount = 0
+local lastNotifyTime = 0
+local lastAttackTime = 0
+local killCount = 0
+local hitCount = 0
+
+local BODY_PARTS = {
+	"Head",
+	"UpperTorso",
+	"LowerTorso",
+	"LeftUpperArm",
+	"LeftLowerArm",
+	"RightUpperArm",
+	"RightLowerArm",
+	"LeftUpperLeg",
+	"LeftLowerLeg",
+	"RightUpperLeg",
+	"RightLowerLeg",
+	"LeftFoot",
+	"LeftHand",
+	"RightFoot",
+	"RightHand"
+}
+local RANDOM_BODYPART_ENABLED = true
+
+local tracerColor = Color3.fromRGB(215, 127, 156)
+local tracerTransparency = 0
+local tracerLifetime = 5
+
+local beamTemplate = {
+	Texture = "rbxassetid://446111271",
+	TextureMode = Enum.TextureMode.Wrap,
+	TextureLength = 10,
+	LightEmission = 1,
+	LightInfluence = 1,
+	FaceCamera = true,
+	ZOffset = -1,
+	Enabled = true
+}
+
+local beamFolder = Instance.new("Folder")
+beamFolder.Name = "BulletTracers"
+beamFolder.Parent = workspace
+
+local hitModelFolder = Instance.new("Folder")
+hitModelFolder.Name = "HitModels"
+hitModelFolder.Parent = workspace
+
+local hitModelsByPlayer = {}
+
+local currentTarget = "无"
+local currentBodyPart = "无"
+
+local HitLogs = {
+	Enabled = true,
+	MaxLogs = 5,
+	Logs = {},
+	Gui = nil
+}
+
+local function SetupHitLogsGui()
+	if HitLogs.Gui and HitLogs.Gui.Parent then return end
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Parent = playerGui
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Frame"
+	frame.Size = UDim2.new(0, 0, 0, 0)
+	frame.AutomaticSize = Enum.AutomaticSize.XY
+	frame.Position = UDim2.new(0, 50, 0.3, 0)
+	frame.BackgroundTransparency = 1
+	frame.Parent = screenGui
+
+	local uiList = Instance.new("UIListLayout")
+	uiList.SortOrder = Enum.SortOrder.LayoutOrder
+	uiList.Padding = UDim.new(0, 5)
+	uiList.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	uiList.Parent = frame
+
+	HitLogs.Gui = screenGui
+end
+
+local function AddHitLog(username, part, health)
+	if not HitLogs.Enabled or not HitLogs.Gui then return end
+
+	local pinkColor = '<font color="rgb(230, 143, 164)">'
+	local whiteColor = '<font color="rgb(255, 255, 255)">'
+	local reset = '</font>'
+
+	local text = whiteColor.."hit "..reset .. pinkColor..username..reset .. whiteColor.." in "..reset .. pinkColor..part..reset .. whiteColor.." for "..reset .. pinkColor..tostring(health)..reset .. whiteColor.." hp"..reset
+
+	local frame = HitLogs.Gui:FindFirstChild("Frame")
+	if frame then
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(0, 0, 0, 20)
+		label.AutomaticSize = Enum.AutomaticSize.X
+		label.BackgroundColor3 = Color3.new(0, 0, 0)
+		label.BackgroundTransparency = 0.9
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 0)
+		corner.Parent = label
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 5)
+		padding.PaddingRight = UDim.new(0, 5)
+		padding.Parent = label
+
+		label.Text = text
+		label.RichText = true
+		label.FontFace = Font.new("rbxassetid://12187371840", Enum.FontWeight.Regular)
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextSize = 13
+		label.TextStrokeTransparency = 1
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextYAlignment = Enum.TextYAlignment.Center
+
+		local uiStroke = Instance.new("UIStroke")
+		uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		uiStroke.Color = Color3.new(0, 0, 0)
+		uiStroke.Transparency = 0.5
+		uiStroke.Thickness = 0.2
+		uiStroke.Parent = label
+
+		label.Parent = frame
+		table.insert(HitLogs.Logs, 1, label)
+
+		while #HitLogs.Logs > HitLogs.MaxLogs do
+			local oldestLog = table.remove(HitLogs.Logs)
+			if oldestLog and oldestLog.Parent then
+				oldestLog:Destroy()
+			end
+		end
+
+		task.delay(4, function()
+			if label and label.Parent then
+				label:Destroy()
+				for i = #HitLogs.Logs, 1, -1 do
+					if HitLogs.Logs[i] == label then
+						table.remove(HitLogs.Logs, i)
+						break
+					end
+				end
+			end
+		end)
+	end
+end
+
+local function AddKillLog(username)
+	if not HitLogs.Enabled or not HitLogs.Gui then return end
+
+	local redColor = '<font color="rgb(255, 80, 80)">'
+	local whiteColor = '<font color="rgb(255, 255, 255)">'
+	local reset = '</font>'
+
+	local text = redColor.."killed "..reset .. whiteColor..username..reset
+
+	local frame = HitLogs.Gui:FindFirstChild("Frame")
+	if frame then
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(0, 0, 0, 20)
+		label.AutomaticSize = Enum.AutomaticSize.X
+		label.BackgroundColor3 = Color3.new(0, 0, 0)
+		label.BackgroundTransparency = 0.9
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 0)
+		corner.Parent = label
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 5)
+		padding.PaddingRight = UDim.new(0, 5)
+		padding.Parent = label
+
+		label.Text = text
+		label.RichText = true
+		label.FontFace = Font.new("rbxassetid://12187371840", Enum.FontWeight.Regular)
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextSize = 13
+		label.TextStrokeTransparency = 1
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextYAlignment = Enum.TextYAlignment.Center
+
+		local uiStroke = Instance.new("UIStroke")
+		uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		uiStroke.Color = Color3.new(0, 0, 0)
+		uiStroke.Transparency = 0.5
+		uiStroke.Thickness = 0.2
+		uiStroke.Parent = label
+
+		label.Parent = frame
+		table.insert(HitLogs.Logs, 1, label)
+
+		while #HitLogs.Logs > HitLogs.MaxLogs do
+			local oldestLog = table.remove(HitLogs.Logs)
+			if oldestLog and oldestLog.Parent then
+				oldestLog:Destroy()
+			end
+		end
+
+		task.delay(4, function()
+			if label and label.Parent then
+				label:Destroy()
+				for i = #HitLogs.Logs, 1, -1 do
+					if HitLogs.Logs[i] == label then
+						table.remove(HitLogs.Logs, i)
+						break
+					end
+				end
+			end
+		end)
+	end
+end
+
+SetupHitLogsGui()
+
+local function createBeamTracer(startPos, endPos)
+	local beam = Instance.new("Beam")
+	for k, v in pairs(beamTemplate) do
+		beam[k] = v
+	end
+	beam.Color = ColorSequence.new(tracerColor)
+	beam.Transparency = NumberSequence.new(tracerTransparency)
+	beam.Width0 = 3.0
+	beam.Width1 = 3.0
+	
+	local att0 = Instance.new("Attachment")
+	att0.CFrame = CFrame.new(startPos)
+	att0.Parent = workspace.Terrain
+	
+	local att1 = Instance.new("Attachment")
+	att1.CFrame = CFrame.new(endPos)
+	att1.Parent = workspace.Terrain
+	
+	beam.Attachment0 = att0
+	beam.Attachment1 = att1
+	beam.Parent = beamFolder
+	
+	task.delay(tracerLifetime, function()
+		local fadeElapsed = 0
+		local fadeConn
+		fadeConn = RunService.Heartbeat:Connect(function(dt)
+			fadeElapsed = fadeElapsed + dt
+			local alpha = math.clamp(fadeElapsed / 0.2, 0, 1)
+			beam.Transparency = NumberSequence.new(tracerTransparency + (1 - tracerTransparency) * alpha)
+			if fadeElapsed >= 0.2 then
+				fadeConn:Disconnect()
+				att0:Destroy()
+				att1:Destroy()
+				beam:Destroy()
+			end
+		end)
+	end)
+end
+
+local function createLayeredGlow(part, mainColor, glowColor, transparency)
+	local isHead = part.Name == "Head"
+	
+	local baseColor = Color3.new(glowColor.R * 5, glowColor.G * 5, glowColor.B * 5)
+	
+	local glowAdornment
+	if isHead then
+		glowAdornment = Instance.new("CylinderHandleAdornment")
+		glowAdornment.Height = part.Size.Y + 0.03
+		glowAdornment.Radius = (part.Size.X * 0.5) + 0.03
+		glowAdornment.CFrame = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(0, 1, 0))
+	else
+		glowAdornment = Instance.new("BoxHandleAdornment")
+		glowAdornment.Size = part.Size + Vector3.new(0.03, 0.03, 0.03)
+	end
+	
+	glowAdornment.Name = "Chams"
+	glowAdornment.AlwaysOnTop = true
+	glowAdornment.ZIndex = isHead and 10 or 9
+	glowAdornment.Adornee = part
+	glowAdornment.Color3 = baseColor
+	glowAdornment.Transparency = math.clamp(-1 + transparency, -1, 1)
+	glowAdornment.Shading = Enum.AdornShading.XRayShaded
+	glowAdornment.Parent = part
+	
+	local mainAdornment
+	if isHead then
+		mainAdornment = Instance.new("CylinderHandleAdornment")
+		mainAdornment.Height = part.Size.Y + 0.02
+		mainAdornment.Radius = (part.Size.X * 0.5) + 0.02
+		mainAdornment.CFrame = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(0, 1, 0))
+	else
+		mainAdornment = Instance.new("BoxHandleAdornment")
+		mainAdornment.Size = part.Size + Vector3.new(0.02, 0.02, 0.02)
+	end
+	
+	mainAdornment.Name = "Chams"
+	mainAdornment.AlwaysOnTop = true
+	mainAdornment.ZIndex = 10
+	mainAdornment.Adornee = part
+	mainAdornment.Color3 = mainColor
+	mainAdornment.Transparency = math.clamp(0.3 + transparency, 0, 1)
+	mainAdornment.Parent = part
+	
+	return glowAdornment, mainAdornment
+end
+
+local function createHitModel(targetChar, hitPos, targetUserId)
+	if not targetChar then return end
+	
+	local clonedModel = targetChar:Clone()
+	clonedModel.Name = "HitClone"
+	clonedModel.Parent = hitModelFolder
+	
+	if not hitModelsByPlayer[targetUserId] then
+		hitModelsByPlayer[targetUserId] = {}
+	end
+	
+	local mainColor = Color3.new(0, 0, 0)
+	local glowColor = Color3.new(1, 1, 1)
+	
+	for _, part in ipairs(clonedModel:GetDescendants()) do
+		if part:IsA("BasePart") then
+			createLayeredGlow(part, mainColor, glowColor, 0.3)
+		end
+		
+		if part:IsA("Script") or part:IsA("LocalScript") or part:IsA("ModuleScript") then
+			part:Destroy()
+		end
+		
+		if part:IsA("Humanoid") then
+			part:Destroy()
+		end
+	end
+	
+	if clonedModel.PrimaryPart then
+		clonedModel:SetPrimaryPartCFrame(CFrame.new(hitPos))
+	elseif clonedModel:FindFirstChild("HumanoidRootPart") then
+		clonedModel.HumanoidRootPart.CFrame = CFrame.new(hitPos)
+	end
+	
+	table.insert(hitModelsByPlayer[targetUserId], 1, clonedModel)
+	
+	for i, oldModel in ipairs(hitModelsByPlayer[targetUserId]) do
+		local baseTransparency = 0.3
+		local transparencyAdd = (i - 1) * 0.5
+		local finalTransparency = baseTransparency + transparencyAdd
+		
+		for _, part in ipairs(oldModel:GetDescendants()) do
+			if part:IsA("BasePart") then
+				for _, adornment in ipairs(part:GetChildren()) do
+					if adornment.Name == "Chams" then
+						if adornment:IsA("BoxHandleAdornment") or adornment:IsA("CylinderHandleAdornment") then
+							if adornment.ZIndex < 10 then
+								adornment.Transparency = math.clamp(-1 + finalTransparency, -1, 1)
+							else
+								adornment.Transparency = math.clamp(finalTransparency, 0, 1)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	
+	task.delay(5, function()
+		clonedModel:Destroy()
+		if hitModelsByPlayer[targetUserId] then
+			for i, model in ipairs(hitModelsByPlayer[targetUserId]) do
+				if model == clonedModel then
+					table.remove(hitModelsByPlayer[targetUserId], i)
+					break
+				end
+			end
+		end
+	end)
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "StatsDisplay"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local weaponLabel = Instance.new("TextLabel")
+weaponLabel.Name = "WeaponLabel"
+weaponLabel.Size = UDim2.new(0, 250, 0, 25)
+weaponLabel.Position = UDim2.new(0, 10, 0, 10)
+weaponLabel.BackgroundTransparency = 1
+weaponLabel.Font = Enum.Font.GothamBold
+weaponLabel.TextSize = 16
+weaponLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+weaponLabel.Text = ""
+weaponLabel.TextXAlignment = Enum.TextXAlignment.Left
+weaponLabel.TextStrokeTransparency = 0.5
+weaponLabel.Parent = screenGui
+
+local statsLabel = Instance.new("TextLabel")
+statsLabel.Name = "StatsLabel"
+statsLabel.Size = UDim2.new(0, 250, 0, 25)
+statsLabel.Position = UDim2.new(0, 10, 0, 35)
+statsLabel.BackgroundTransparency = 1
+statsLabel.Font = Enum.Font.Gotham
+statsLabel.TextSize = 14
+statsLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+statsLabel.Text = ""
+statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+statsLabel.TextStrokeTransparency = 0.5
+statsLabel.Parent = screenGui
+
+local targetLabel = Instance.new("TextLabel")
+targetLabel.Name = "TargetLabel"
+targetLabel.Size = UDim2.new(0, 250, 0, 25)
+targetLabel.Position = UDim2.new(0, 10, 0, 60)
+targetLabel.BackgroundTransparency = 1
+targetLabel.Font = Enum.Font.Gotham
+targetLabel.TextSize = 14
+targetLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+targetLabel.Text = ""
+targetLabel.TextXAlignment = Enum.TextXAlignment.Left
+targetLabel.TextStrokeTransparency = 0.5
+targetLabel.Parent = screenGui
+
+local function sendNotification(title, text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = title,
+			Text = text,
+			Duration = 2
+		})
+	end)
+end
+
+local function getWeaponFireRate(weaponName)
+	if WeaponsRegistry and WeaponsRegistry[weaponName] then
+		local weaponData = WeaponsRegistry[weaponName]
+		if weaponData.FireRate and type(weaponData.FireRate) == "number" then
+			return weaponData.FireRate
+		end
+	end
+	return 0.08
+end
+
+local function getRandomBodyPart()
+	if RANDOM_BODYPART_ENABLED then
+		return BODY_PARTS[math.random(1, #BODY_PARTS)]
+	end
+	return nil
+end
+
+local function getCurrentWeapon()
+	local attrWeapon = player:GetAttribute("CurrentWeapon")
+	if attrWeapon and typeof(attrWeapon) == "string" then
+		return attrWeapon
+	end
+	
+	local char = player.Character
+	if char then
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Tool") then
+				return child.Name
+			end
+		end
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Model") then
+				local hasBarrel = child:FindFirstChild("Barrel")
+				local hasMagazine = child:FindFirstChild("Magazine")
+				local hasHandle = child:FindFirstChild("Handle")
+				
+				if (hasBarrel and hasMagazine) or (hasBarrel and hasHandle) then
+					return child.Name
+				end
+			end
+		end
+	end
+	
+	local cam = workspace.CurrentCamera
+	if cam then
+		for _, child in ipairs(cam:GetChildren()) do
+			if child:IsA("Model") then
+				local hasBarrel = child:FindFirstChild("Barrel")
+				local hasMagazine = child:FindFirstChild("Magazine")
+				local hasHandle = child:FindFirstChild("Handle")
+				
+				if (hasBarrel and hasMagazine) or (hasBarrel and hasHandle) then
+					return child.Name
+				end
+			end
+		end
+	end
+	
+	return nil
+end
+
+local function isDead(part)
+	local check = part
+	while check and check ~= workspace do
+		if check:GetAttribute("Dead") == true then
+			return true
+		end
+		check = check.Parent
+	end
+	return false
+end
+
+local function hasWallBetween(fromPos, toPos)
+	local direction = (toPos - fromPos)
+	local distance = direction.Magnitude
+	
+	if distance < 0.1 then return false end
+	
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	
+	local filterList = {}
+	table.insert(filterList, player.Character)
+	table.insert(filterList, workspace.CurrentCamera)
+	
+	local mercPlayers = workspace:FindFirstChild("MercPlayers")
+	if mercPlayers then
+		table.insert(filterList, mercPlayers)
+	end
+	
+	local activeMap = workspace:FindFirstChild("ActiveMap") or workspace:FindFirstChild("Map")
+	if activeMap then
+		local touchables = activeMap:FindFirstChild("Touchables")
+		if touchables then
+			table.insert(filterList, touchables)
+		end
+		local ignore = activeMap:FindFirstChild("Ignore")
+		if ignore then
+			table.insert(filterList, ignore)
+		end
+	end
+	
+	local ignoreFolder = workspace:FindFirstChild("Ignore")
+	if ignoreFolder then
+		table.insert(filterList, ignoreFolder)
+	end
+	
+	raycastParams.FilterDescendantsInstances = filterList
+	
+	local rayResult = workspace:Raycast(fromPos, direction.Unit * (distance - 0.1), raycastParams)
+	
+	return rayResult ~= nil
+end
+
+local function getClosestTarget()
+	local char = player.Character
+	if not char then return nil, nil, nil, nil, nil end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return nil, nil, nil, nil, nil end
+
+	local myUserId = player.UserId
+	local closestDist = math.huge
+	local closestUserId = nil
+	local closestHitPos = nil
+	local closestBodyPart = nil
+	local closestChar = nil
+
+	local tagged = CollectionService:GetTagged("MercBodyPart")
+	for _, part in ipairs(tagged) do
+		if part:IsA("BasePart") and part.Parent then
+			if isDead(part) then
+				continue
+			end
+
+			local ownerId = part:GetAttribute("OwnerUserId")
+			local bodyPartName = part:GetAttribute("MercBodyPart")
+			local targetChar = part:FindFirstAncestorOfClass("Model")
+
+			if targetChar and targetChar.Name == "HitClone" then
+				continue
+			end
+			
+			if targetChar and targetChar.Parent == hitModelFolder then
+				continue
+			end
+
+			if not ownerId or not bodyPartName then
+				if targetChar then
+					ownerId = ownerId or targetChar:GetAttribute("OwnerUserId")
+					bodyPartName = bodyPartName or part.Name
+				end
+			end
+
+			if ownerId and typeof(ownerId) == "number" and ownerId ~= myUserId and bodyPartName then
+				local dist = (root.Position - part.Position).Magnitude
+				if dist < closestDist then
+					if not hasWallBetween(root.Position, part.Position) then
+						closestDist = dist
+						closestUserId = ownerId
+						closestHitPos = part.Position
+						closestBodyPart = bodyPartName
+						closestChar = targetChar
+					end
+				end
+			end
+		end
+	end
+
+	if closestUserId and closestHitPos and closestBodyPart then
+		local direction = (closestHitPos - root.Position).Unit
+		return closestUserId, closestHitPos, direction, closestBodyPart, closestChar
+	end
+	return nil, nil, nil, nil, nil
+end
+
+local shotSequence = 0
+
+BulletController.HitConfirmed:Connect(function()
+	hitCount = hitCount + 1
+	statsLabel.Text = string.format("K:%d | H:%d", killCount, hitCount)
+	AddHitLog("Player", currentBodyPart, 100)
+end)
+
+BulletController.KillConfirmed:Connect(function()
+	killCount = killCount + 1
+	statsLabel.Text = string.format("K:%d | H:%d", killCount, hitCount)
+	AddKillLog("Player")
+end)
+
+RunService.Heartbeat:Connect(function()
+	MaintainInfiniteAmmo()
+	ApplyGunControllerMods()
+
+	local weapon = getCurrentWeapon()
+	if not weapon then return end
+
+	if weapon ~= currentWeaponName then
+		currentWeaponName = weapon
+		currentFireRate = getWeaponFireRate(weapon)
+		local rpm = math.floor(60 / currentFireRate)
+		weaponLabel.Text = string.format("%s | %d RPM", weapon, rpm)
+		statsLabel.Text = string.format("K:%d | H:%d", killCount, hitCount)
+		sendNotification("weapon", string.format("%s | %d RPM", weapon, rpm))
+
+		if InfiniteAmmo.Enabled then
+			SetupInfiniteAmmo()
+		end
+		
+		ApplyGunControllerMods()
+	end
+
+	local currentTime = tick()
+	if currentTime - lastAttackTime < currentFireRate then
+		return
+	end
+
+	local targetUserId, hitPos, direction, bodyPart, targetChar = getClosestTarget()
+	if not (targetUserId and hitPos and direction and bodyPart) then return end
+
+	local char = player.Character
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local randomBodyPart = getRandomBodyPart()
+	if randomBodyPart then
+		bodyPart = randomBodyPart
+	end
+
+	local origin = root.Position
+	
+	if currentTime - lastAttackTime < currentFireRate then
+		return
+	end
+	
+	shotSequence = shotSequence + 1
+	attackCount = attackCount + 1
+	lastAttackTime = currentTime
+	
+	currentTarget = tostring(targetUserId)
+	currentBodyPart = bodyPart
+	
+	if GunController and GunController.FireWeapon then
+		GunController:FireWeapon()
+	end
+	
+	WeaponFired:FireServer(weapon, origin, direction, targetUserId, shotSequence)
+	MercHitClaim:FireServer(weapon, targetUserId, bodyPart, origin, direction, hitPos, shotSequence)
+	
+	local isHeadshot = (bodyPart == "Head")
+	createHitmarker(hitPos, isHeadshot)
+	
+	createBeamTracer(origin, hitPos)
+	createHitModel(targetChar, hitPos, targetUserId)
+	
+	targetLabel.Text = string.format("target: #%s | part: %s", currentTarget, currentBodyPart)
+end)
